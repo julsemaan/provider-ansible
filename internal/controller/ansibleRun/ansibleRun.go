@@ -37,12 +37,16 @@ import (
 	"github.com/crossplane/crossplane-runtime/pkg/reconciler/managed"
 	"github.com/crossplane/crossplane-runtime/pkg/resource"
 	"github.com/crossplane/crossplane-runtime/pkg/statemetrics"
+	"github.com/google/uuid"
 	"github.com/spf13/afero"
 	"gopkg.in/yaml.v2"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/pointer"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -128,6 +132,7 @@ func Setup(mgr ctrl.Manager, o controller.Options, s SetupOptions) error {
 				ArtifactsHistoryLimit: s.ArtifactsHistoryLimit,
 			}
 		},
+		replicaID: uuid.New().String(),
 	}
 
 	opts := []managed.ReconcilerOption{
@@ -159,13 +164,16 @@ func Setup(mgr ctrl.Manager, o controller.Options, s SetupOptions) error {
 // A connector is expected to produce an ExternalClient when its Connect method
 // is called.
 type connector struct {
-	kube    client.Client
-	usage   resource.Tracker
-	fs      afero.Afero
-	ansible func(dir string) params
+	kube      client.Client
+	usage     resource.Tracker
+	fs        afero.Afero
+	ansible   func(dir string) params
+	replicaID string
 }
 
 func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.ExternalClient, error) { //nolint:gocyclo
+	fmt.Println("AYO I'm in Connect", mg.GetName())
+
 	// NOTE(negz): This method is slightly over our complexity goal, but I
 	// can't immediately think of a clean way to decompose it without
 	// affecting readability.
@@ -321,17 +329,23 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 
 	}
 
-	return &external{runner: r, kube: c.kube}, nil
+	return &external{runner: r, kube: c.kube, replicaID: c.replicaID}, nil
 }
 
 type external struct {
-	runner ansibleRunner
-	kube   client.Client
+	runner    ansibleRunner
+	kube      client.Client
+	replicaID string
 }
 
 // nolint: gocyclo
 // TODO reduce cyclomatic complexity
 func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.ExternalObservation, error) {
+	fmt.Println("AYO I'm in Observe", mg.GetName())
+	if err := c.acquireLease(ctx, mg); err != nil {
+		return managed.ExternalObservation{}, errors.New(fmt.Sprintf("unable to obtain lease: %s", err))
+	}
+
 	cr, ok := mg.(*v1alpha1.AnsibleRun)
 	if !ok {
 		return managed.ExternalObservation{}, errors.New(errNotAnsibleRun)
@@ -401,12 +415,22 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 }
 
 func (c *external) Create(ctx context.Context, mg resource.Managed) (managed.ExternalCreation, error) {
+	fmt.Println("AYO I'm in Create", mg.GetName())
+	if err := c.acquireLease(ctx, mg); err != nil {
+		return managed.ExternalCreation{}, errors.New(fmt.Sprintf("unable to obtain lease: %s", err))
+	}
+
 	// No difference from the provider side which lifecycle method to choose in this case of Create() or Update()
 	u, err := c.Update(ctx, mg)
 	return managed.ExternalCreation(u), err
 }
 
 func (c *external) Update(ctx context.Context, mg resource.Managed) (managed.ExternalUpdate, error) {
+	fmt.Println("AYO I'm in Update", mg.GetName())
+	if err := c.acquireLease(ctx, mg); err != nil {
+		return managed.ExternalUpdate{}, errors.New(fmt.Sprintf("unable to obtain lease: %s", err))
+	}
+
 	cr, ok := mg.(*v1alpha1.AnsibleRun)
 	if !ok {
 		return managed.ExternalUpdate{}, errors.New(errNotAnsibleRun)
@@ -423,6 +447,11 @@ func (c *external) Update(ctx context.Context, mg resource.Managed) (managed.Ext
 }
 
 func (c *external) Delete(ctx context.Context, mg resource.Managed) error {
+	fmt.Println("AYO I'm in Delete", mg.GetName())
+	if err := c.acquireLease(ctx, mg); err != nil {
+		return errors.New(fmt.Sprintf("unable to obtain lease: %s", err))
+	}
+
 	cr, ok := mg.(*v1alpha1.AnsibleRun)
 	if !ok {
 		return errors.New(errNotAnsibleRun)
@@ -526,4 +555,104 @@ func addBehaviorVars(pc *v1alpha1.ProviderConfig) map[string]string {
 		behaviorVars[v.Key] = v.Value
 	}
 	return behaviorVars
+}
+
+func (c *connector) acquireLease(ctx context.Context, mg resource.Managed) error {
+	lease := &coordinationv1.Lease{}
+	leaseName := "lease-" + mg.GetName()
+
+	ns := "upbound-system"
+
+	if err := c.kube.Get(ctx, client.ObjectKey{Namespace: ns, Name: leaseName}, lease); err != nil {
+		if !kerrors.IsNotFound(err) {
+			return err
+		}
+
+		// Create a new Lease
+		lease = &coordinationv1.Lease{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      leaseName,
+				Namespace: ns,
+			},
+			Spec: coordinationv1.LeaseSpec{
+				HolderIdentity:       &c.replicaID,
+				LeaseDurationSeconds: pointer.Int32(120),
+			},
+		}
+		if err := c.kube.Create(ctx, lease); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	// Check if the lease is held by another replica and is not expired
+	if lease.Spec.HolderIdentity != nil && *lease.Spec.HolderIdentity != c.replicaID {
+		if lease.Spec.RenewTime != nil && time.Since(lease.Spec.RenewTime.Time) < time.Duration(*lease.Spec.LeaseDurationSeconds)*time.Second {
+			// Lease is held by another replica and is not expired
+			return nil
+		}
+	}
+
+	// Update the lease to acquire it
+	lease.Spec.HolderIdentity = pointer.String(c.replicaID)
+	lease.Spec.RenewTime = &metav1.MicroTime{Time: time.Now()}
+	if err := c.kube.Update(ctx, lease); err != nil {
+		if kerrors.IsConflict(err) {
+			// Another replica updated the lease concurrently, retry
+			return nil
+		}
+		return fmt.Errorf("failed to update lease: %w", err)
+	}
+
+	return nil
+}
+
+func (c *external) acquireLease(ctx context.Context, mg resource.Managed) error {
+	lease := &coordinationv1.Lease{}
+	leaseName := "lease-" + mg.GetName()
+
+	ns := "upbound-system"
+
+	if err := c.kube.Get(ctx, client.ObjectKey{Namespace: ns, Name: leaseName}, lease); err != nil {
+		if !kerrors.IsNotFound(err) {
+			return err
+		}
+
+		// Create a new Lease
+		lease = &coordinationv1.Lease{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      leaseName,
+				Namespace: ns,
+			},
+			Spec: coordinationv1.LeaseSpec{
+				HolderIdentity:       &c.replicaID,
+				LeaseDurationSeconds: pointer.Int32(120),
+			},
+		}
+		if err := c.kube.Create(ctx, lease); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	// Check if the lease is held by another replica and is not expired
+	if lease.Spec.HolderIdentity != nil && *lease.Spec.HolderIdentity != c.replicaID {
+		if lease.Spec.RenewTime != nil && time.Since(lease.Spec.RenewTime.Time) < time.Duration(*lease.Spec.LeaseDurationSeconds)*time.Second {
+			// Lease is held by another replica and is not expired
+			return errors.New("Lease is held by another replica and is not expired")
+		}
+	}
+
+	// Update the lease to acquire it
+	lease.Spec.HolderIdentity = pointer.String(c.replicaID)
+	lease.Spec.RenewTime = &metav1.MicroTime{Time: time.Now()}
+	if err := c.kube.Update(ctx, lease); err != nil {
+		if kerrors.IsConflict(err) {
+			// Another replica updated the lease concurrently, retry
+			return errors.New("Another replica updated the lease concurrently, retry")
+		}
+		return fmt.Errorf("failed to update lease: %w", err)
+	}
+
+	return nil
 }
